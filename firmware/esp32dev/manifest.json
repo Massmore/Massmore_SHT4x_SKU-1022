@@ -1,0 +1,37 @@
+{
+  "name": "Massmore SHT4X Factory Test",
+  "version": "1.0.0",
+  "sku": "SKU-1022",
+  "product": "Massmore SHT4X Temperature & Humidity Sensor (SHT40 / SHT41 / SHT45, B และ F)",
+  "product_url": "https://www.massmore.shop",
+  "library": "Massmore_SHT4x 1.0.0",
+  "built_with": {
+    "platform": "pioarduino platform-espressif32 55.03.311",
+    "arduino_core": "3.3.11",
+    "framework": "arduino",
+    "toolchain": "xtensa-esp-elf"
+  },
+  "chip_family": "ESP32",
+  "board": "esp32dev",
+  "flash_mode": "dio",
+  "flash_freq": "40m",
+  "flash_size": "4MB",
+  "monitor_speed": 115200,
+  "upload_speed": 512000,
+  "pins": {
+    "sda": 21,
+    "scl": 22
+  },
+  "i2c_address": ["0x44", "0x45", "0x46"],
+  "parts": [
+    { "path": "bootloader.bin", "offset": "0x1000" },
+    { "path": "partitions.bin", "offset": "0x8000" },
+    { "path": "boot_app0.bin", "offset": "0xe000" },
+    { "path": "Massmore_SHT4x_FactoryTest_v1.0.0_esp32dev.bin", "offset": "0x10000" }
+  ],
+  "merged": {
+    "path": "Massmore_SHT4x_FactoryTest_v1.0.0_esp32dev_merged.bin",
+    "offset": "0x0",
+    "note": "ไฟล์เดียวจบ เขียนที่ offset 0 ใช้กับ ESP Web Tools ได้เลย"
+  }
+}

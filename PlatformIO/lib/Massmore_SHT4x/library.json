@@ -1,0 +1,27 @@
+{
+  "name": "Massmore_SHT4x",
+  "version": "1.0.0",
+  "description": "ไลบรารีสำหรับเซ็นเซอร์อุณหภูมิและความชื้น Sensirion SHT4x (SHT40/SHT41/SHT45) ทั้งรุ่นปกติและรุ่นกันฝุ่น รองรับการวัดสามระดับความละเอียด ฮีตเตอร์ 6 โหมด ซีเรียลจากโรงงาน และการตรวจชิปแท้",
+  "keywords": ["sensor", "temperature", "humidity", "sht4x", "sht40", "sht41", "sht45", "sensirion", "i2c", "qwiic", "massmore"],
+  "authors": [
+    {
+      "name": "Massmore",
+      "email": "info@massmore.shop",
+      "url": "https://www.massmore.shop",
+      "maintainer": true
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Massmore/Massmore_SHT4x_SKU-1022.git"
+  },
+  "license": "MIT",
+  "homepage": "https://www.massmore.shop",
+  "frameworks": ["arduino"],
+  "platforms": "*",
+  "headers": ["Massmore_SHT4x.h"],
+  "dependencies": [],
+  "export": {
+    "exclude": ["examples/**/build", "*.zip"]
+  }
+}
