@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="../images/01_massmore_sht4x_cover.png" alt="Massmore SHT4X" width="440">
+<img src="../docs/images/01_massmore_sht4x_cover.png" alt="Massmore SHT4X" width="440">
 
 # เฟิร์มแวร์ Factory Test
 
@@ -40,7 +40,7 @@
 ### การต่อสาย
 
 <div align="center">
-<img src="../images/03_massmore_sht4x_wiring_esp32.png" alt="การต่อสาย" width="440">
+<img src="../docs/images/03_massmore_sht4x_wiring_esp32.png" alt="การต่อสาย" width="440">
 </div>
 
 | ขา SHT4X | ต่อไปที่ ESP32 | จำเป็นไหม |
