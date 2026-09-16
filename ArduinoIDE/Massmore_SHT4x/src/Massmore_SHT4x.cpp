@@ -1,39 +1,33 @@
-/*!
- * @file Massmore_SHT4x.cpp
- * @brief การทำงานภายในของไลบรารี Massmore SHT4x
+/**
+ * @file    Massmore_SHT4x.cpp
+ * @brief   การทำงานภายในของไลบรารี Massmore_SHT4x (อ้างอิง Datasheet SHT4x V7.3)
  *
  * @copyright Copyright (c) 2026 Massmore Biz Co., Ltd.
- * @license MIT
+ * @license   MIT
  */
 
 #include "Massmore_SHT4x.h"
 
 #include <math.h>
 
-/* ค่าคงที่สำหรับสูตร Magnus (ใช้ทั้ง dewPoint และความดันไออิ่มตัว) */
+/* ค่าคงที่สูตร Magnus (dewPoint / absoluteHumidity) */
 #define MASSMORE_SHT4X_MAGNUS_A 17.62f
 #define MASSMORE_SHT4X_MAGNUS_B 243.12f
 
-/* เวลาที่ใช้ "แหย่" ดูว่าชิป NACK ตอนยังวัดไม่เสร็จจริงไหม (ใช้ใน verifyChip) */
-#define MASSMORE_SHT4X_PROBE_EARLY_MS 2
+/* เวลา "แหย่" อ่านก่อนวัดเสร็จเพื่อดูว่าชิป NACK จริง (isGenuine ข้อ 8) */
+#define MASSMORE_SHT4X_PROBE_EARLY_MS 1
 
 /* ========================================================================= */
-/* ตัวสร้าง                                                                  */
+/* Construction / begin                                                      */
 /* ========================================================================= */
 
-MassmoreSHT4x::MassmoreSHT4x(TwoWire *wire)
-    : _wire(wire), _address(MASSMORE_SHT4X_I2C_ADDR_DEFAULT), _begun(false),
-      _timeoutMs(MASSMORE_SHT4X_TIMEOUT_DEFAULT_MS),
-      _variant(MASSMORE_SHT4X_VARIANT_AUTO),
-      _package(MASSMORE_SHT4X_PACKAGE_UNKNOWN),
-      _precision(MASSMORE_SHT4X_PRECISION_HIGH),
-      _mode(MASSMORE_SHT4X_MODE_IDLE), _humidityClipping(true),
-      _temperatureOffset(0.0f), _humidityOffset(0.0f), _operationStartMs(0),
-      _operationDurationMs(0), _pendingHeated(false), _updateIntervalMs(1000),
-      _lastUpdateStartMs(0), _heaterDutyGuard(true), _heaterOnTimeMs(0),
-      _heaterEpochMs(0), _serialNumber(0), _verifyMask(0),
-      _genuine(MASSMORE_SHT4X_GENUINE_UNKNOWN), _callback(nullptr),
-      _error(MASSMORE_SHT4X_OK) {
+Massmore_SHT4x::Massmore_SHT4x(TwoWire &wirePort)
+    : _wire(&wirePort), _address(I2C_ADDR_DEFAULT), _begun(false),
+      _timeoutMs(TIMEOUT_DEFAULT_MS), _variant(Variant::UNKNOWN),
+      _temperatureOffset(0.0f), _humidityOffset(0.0f), _error(ErrorCode::OK),
+      _state(State::IDLE), _opStartMs(0), _opDurationMs(0), _opHeated(false),
+      _dutyGuard(true), _heaterEndMs(0), _heaterLastDurationMs(0),
+      _heaterUsed(false), _serialNumber(0), _genuineMask(0) {
   _reading.temperature = NAN;
   _reading.humidity = NAN;
   _reading.rawTemperature = 0;
@@ -42,435 +36,142 @@ MassmoreSHT4x::MassmoreSHT4x(TwoWire *wire)
   _reading.heated = false;
 }
 
-/* ========================================================================= */
-/* การเริ่มต้นใช้งาน                                                          */
-/* ========================================================================= */
-
-bool MassmoreSHT4x::begin(uint8_t address, massmore_sht4x_variant_t variant,
-                          int8_t sdaPin, int8_t sclPin, uint32_t frequency) {
-  if (_wire == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-  if (address != MASSMORE_SHT4X_I2C_ADDR_A && address != MASSMORE_SHT4X_I2C_ADDR_B &&
-      address != MASSMORE_SHT4X_I2C_ADDR_C) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-
-#if defined(ARDUINO_ARCH_ESP32) || defined(ARDUINO_ARCH_ESP8266)
-  /* ESP32 และ ESP8266 เลือกขา I2C ได้อิสระ */
-  if (sdaPin >= 0 && sclPin >= 0) {
-    _wire->begin((int)sdaPin, (int)sclPin);
-  } else {
-    _wire->begin();
-  }
-  _wire->setClock(frequency);
-#else
-  /* บอร์ดอื่นใช้ขาตายตัวของฮาร์ดแวร์ */
-  (void)sdaPin;
-  (void)sclPin;
-  _wire->begin();
-  _wire->setClock(frequency);
-#endif
-
-  return beginWithExistingBus(address, variant);
+bool Massmore_SHT4x::begin(TwoWire &wirePort, uint8_t address, Variant variant) {
+  _wire = &wirePort;
+  return begin(address, variant);
 }
 
-bool MassmoreSHT4x::beginWithExistingBus(uint8_t address,
-                                         massmore_sht4x_variant_t variant) {
-  if (_wire == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
+bool Massmore_SHT4x::begin(uint8_t address, Variant variant) {
+  if (address != I2C_ADDR_A && address != I2C_ADDR_B && address != I2C_ADDR_C) {
+    return setError(ErrorCode::BAD_ARG);
   }
-  if (address != MASSMORE_SHT4X_I2C_ADDR_A && address != MASSMORE_SHT4X_I2C_ADDR_B &&
-      address != MASSMORE_SHT4X_I2C_ADDR_C) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-
   _address = address;
   _variant = variant;
-  _begun = true;
-  _mode = MASSMORE_SHT4X_MODE_READY;
+  _state = State::IDLE;
+  _heaterUsed = false;
 
-  /* เริ่มนับ duty cycle ของฮีตเตอร์ใหม่ทุกครั้งที่ begin() */
-  resetHeaterStats();
+  /* datasheet: หลัง power-up ต้องรอสูงสุด 1 ms ก่อนส่งคำสั่งแรก */
+  delay(1);
 
+  if (!isConnected()) {
+    return false; /* NOT_FOUND */
+  }
   if (!softReset()) {
-    _begun = false;
-    _mode = MASSMORE_SHT4X_MODE_IDLE;
     return false;
   }
 
-  /* ยืนยันว่าชิปคุยได้จริงด้วยการอ่านซีเรียลจากโรงงาน */
-  uint32_t serial = 0;
-  if (!readSerialNumber(&serial)) {
+  /* ยืนยันว่าเป็น SHT4x จริงด้วยการอ่าน Serial Number (ไม่มี CHIP_ID register) */
+  _begun = true;
+  if (!verifyChipID()) {
     _begun = false;
-    _mode = MASSMORE_SHT4X_MODE_IDLE;
     return false;
   }
-
-  clearError();
   return true;
 }
 
-bool MassmoreSHT4x::isConnected() {
-  if (_wire == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
+bool Massmore_SHT4x::isConnected() {
   _wire->beginTransmission(_address);
   if (_wire->endTransmission() != 0) {
-    return setError(MASSMORE_SHT4X_ERR_NO_DEVICE);
+    return setError(ErrorCode::NOT_FOUND);
   }
+  _error = ErrorCode::OK;
   return true;
 }
 
-void MassmoreSHT4x::setTimeout(uint16_t milliseconds) { _timeoutMs = milliseconds; }
+void Massmore_SHT4x::setTimeout(uint16_t timeoutMs) { _timeoutMs = timeoutMs; }
 
 /* ========================================================================= */
-/* การตั้งค่า                                                                 */
+/* Low-level I2C                                                             */
 /* ========================================================================= */
 
-void MassmoreSHT4x::setPrecision(massmore_sht4x_precision_t precision) {
-  _precision = precision;
-}
-
-massmore_sht4x_precision_t MassmoreSHT4x::getPrecision() const { return _precision; }
-
-const char *MassmoreSHT4x::precisionToString(massmore_sht4x_precision_t precision) {
-  switch (precision) {
-  case MASSMORE_SHT4X_PRECISION_LOW:
-    return "LOW";
-  case MASSMORE_SHT4X_PRECISION_MEDIUM:
-    return "MEDIUM";
-  case MASSMORE_SHT4X_PRECISION_HIGH:
-    return "HIGH";
-  default:
-    return "UNKNOWN";
-  }
-}
-
-void MassmoreSHT4x::setTemperatureOffset(float offsetCelsius) {
-  _temperatureOffset = offsetCelsius;
-}
-
-float MassmoreSHT4x::getTemperatureOffset() const { return _temperatureOffset; }
-
-void MassmoreSHT4x::setHumidityOffset(float offsetPercent) {
-  _humidityOffset = offsetPercent;
-}
-
-float MassmoreSHT4x::getHumidityOffset() const { return _humidityOffset; }
-
-void MassmoreSHT4x::setHumidityClipping(bool enabled) { _humidityClipping = enabled; }
-
-bool MassmoreSHT4x::getHumidityClipping() const { return _humidityClipping; }
-
-void MassmoreSHT4x::setVariant(massmore_sht4x_variant_t variant) { _variant = variant; }
-
-massmore_sht4x_variant_t MassmoreSHT4x::getVariant() const { return _variant; }
-
-const char *MassmoreSHT4x::getVariantName() const {
-  switch (_variant) {
-  case MASSMORE_SHT4X_VARIANT_SHT40:
-    return "SHT40";
-  case MASSMORE_SHT4X_VARIANT_SHT41:
-    return "SHT41";
-  case MASSMORE_SHT4X_VARIANT_SHT45:
-    return "SHT45";
-  case MASSMORE_SHT4X_VARIANT_AUTO:
-  default:
-    return "SHT4x";
-  }
-}
-
-float MassmoreSHT4x::getTemperatureAccuracy() const {
-  switch (_variant) {
-  case MASSMORE_SHT4X_VARIANT_SHT45:
-    return 0.1f;
-  case MASSMORE_SHT4X_VARIANT_SHT40:
-  case MASSMORE_SHT4X_VARIANT_SHT41:
-  case MASSMORE_SHT4X_VARIANT_AUTO:
-  default:
-    return 0.2f;
-  }
-}
-
-float MassmoreSHT4x::getHumidityAccuracy() const {
-  switch (_variant) {
-  case MASSMORE_SHT4X_VARIANT_SHT45:
-    return 1.0f;
-  case MASSMORE_SHT4X_VARIANT_SHT40:
-  case MASSMORE_SHT4X_VARIANT_SHT41:
-  case MASSMORE_SHT4X_VARIANT_AUTO:
-  default:
-    return 1.8f;
-  }
-}
-
-void MassmoreSHT4x::setPackage(massmore_sht4x_package_t package) { _package = package; }
-
-massmore_sht4x_package_t MassmoreSHT4x::getPackage() const { return _package; }
-
-const char *MassmoreSHT4x::getPackageName() const {
-  switch (_package) {
-  case MASSMORE_SHT4X_PACKAGE_B:
-    return "B (ช่องเปิด)";
-  case MASSMORE_SHT4X_PACKAGE_F:
-    return "F (กันฝุ่น)";
-  case MASSMORE_SHT4X_PACKAGE_UNKNOWN:
-  default:
-    return "ไม่ระบุ";
-  }
-}
-
-/* ========================================================================= */
-/* ชั้นสื่อสารกับบัส I2C                                                      */
-/* ========================================================================= */
-
-bool MassmoreSHT4x::sendCommand(uint8_t command) {
-  if (_wire == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
+bool Massmore_SHT4x::sendCommand(uint8_t command) {
   _wire->beginTransmission(_address);
   _wire->write(command);
-  if (_wire->endTransmission() != 0) {
-    return setError(MASSMORE_SHT4X_ERR_I2C_WRITE);
+  uint8_t rc = _wire->endTransmission();
+  if (rc == 2 || rc == 3) {
+    /* 2 = NACK on address, 3 = NACK on data */
+    return setError(ErrorCode::NOT_FOUND);
+  }
+  if (rc != 0) {
+    return setError(ErrorCode::BUS_ERROR);
   }
   return true;
 }
 
-bool MassmoreSHT4x::readBytes(uint8_t *buffer, uint8_t length) {
-  if (_wire == nullptr || buffer == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-  if (length == 0 || (length % 3) != 0) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-
-  /*
-   * SHT4x ไม่รองรับ clock stretching ถ้ายังวัดไม่เสร็จชิปจะ NACK
-   * ที่ header ทำให้ requestFrom() คืนจำนวนไบต์ไม่ครบ
-   * กรณีนี้ไม่ใช่ความเสียหาย แต่แปลว่า "ยังไม่พร้อม"
-   */
-  uint8_t got = _wire->requestFrom(_address, length);
-  if (got != length) {
-    return setError(MASSMORE_SHT4X_ERR_I2C_READ);
-  }
-
-  uint32_t deadline = millis() + _timeoutMs;
-  for (uint8_t i = 0; i < length; i++) {
-    while (_wire->available() == 0) {
-      if ((int32_t)(millis() - deadline) >= 0) {
-        return setError(MASSMORE_SHT4X_ERR_TIMEOUT);
-      }
+/*
+ * อ่าน frame 6 byte: word(2) + CRC(1) + word(2) + CRC(1)
+ * SHT4x ไม่รองรับ clock stretching: ถ้าวัดยังไม่เสร็จชิปจะ NACK ที่ address
+ * ทำให้ requestFrom() คืน 0 → รายงานเป็น NOT_READY (ไม่ใช่ความเสียหาย)
+ */
+bool Massmore_SHT4x::readFrame(uint16_t &first, uint16_t &second) {
+  uint8_t buf[FRAME_LEN];
+  uint8_t got = _wire->requestFrom((uint8_t)_address, (uint8_t)FRAME_LEN);
+  if (got != FRAME_LEN) {
+    /* ทิ้งข้อมูลค้าง (ถ้ามี) */
+    while (_wire->available() > 0) {
+      (void)_wire->read();
     }
-    buffer[i] = (uint8_t)_wire->read();
+    return setError(ErrorCode::NOT_READY);
   }
-
-  /* ทุก 2 ไบต์ข้อมูลจะมี CRC ต่อท้าย 1 ไบต์เสมอ */
-  for (uint8_t i = 0; i + 2 < length; i += 3) {
-    if (crc8(&buffer[i], 2) != buffer[i + 2]) {
-      return setError(MASSMORE_SHT4X_ERR_CRC);
-    }
+  for (uint8_t i = 0; i < FRAME_LEN; i++) {
+    buf[i] = (uint8_t)_wire->read();
   }
+  if (crc8(&buf[0], 2) != buf[2] || crc8(&buf[3], 2) != buf[5]) {
+    return setError(ErrorCode::CRC_FAIL);
+  }
+  first = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+  second = (uint16_t)(((uint16_t)buf[3] << 8) | buf[4]);
   return true;
 }
 
-bool MassmoreSHT4x::commandAndRead(uint8_t command, uint16_t waitMs, uint16_t *first,
-                                   uint16_t *second) {
-  if (first == nullptr || second == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
+/* ลองอ่านซ้ำทุก 1 ms จนกว่าชิปจะเลิก NACK หรือครบ timeout (rollover-safe) */
+bool Massmore_SHT4x::readFrameWithRetry(uint16_t &first, uint16_t &second,
+                                        uint16_t timeoutMs) {
+  uint32_t t0 = millis();
+  for (;;) {
+    if (readFrame(first, second)) {
+      return true;
+    }
+    if (_error != ErrorCode::NOT_READY) {
+      return false; /* CRC_FAIL หรืออื่น ๆ ไม่ต้องรอต่อ */
+    }
+    if ((uint32_t)(millis() - t0) >= timeoutMs) {
+      return setError(ErrorCode::TIMEOUT);
+    }
+    delay(1);
+  }
+}
+
+bool Massmore_SHT4x::measureBlocking(uint8_t command, uint16_t waitMs, bool heated) {
+  if (!_begun) {
+    return setError(ErrorCode::NOT_BEGUN);
+  }
+  if (_state == State::MEASURING || _state == State::HEATING) {
+    return setError(ErrorCode::BUSY);
   }
   if (!sendCommand(command)) {
     return false;
   }
   delay(waitMs);
-
-  uint8_t buffer[MASSMORE_SHT4X_MEAS_FRAME_LEN];
-  if (!readBytes(buffer, MASSMORE_SHT4X_MEAS_FRAME_LEN)) {
+  uint16_t rawT = 0;
+  uint16_t rawRH = 0;
+  if (!readFrameWithRetry(rawT, rawRH, _timeoutMs)) {
     return false;
   }
-  *first = (uint16_t)(((uint16_t)buffer[0] << 8) | buffer[1]);
-  *second = (uint16_t)(((uint16_t)buffer[3] << 8) | buffer[4]);
+  storeReading(rawT, rawRH, heated);
+  _error = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreSHT4x::readFrame(uint16_t *rawT, uint16_t *rawRH) {
-  uint8_t buffer[MASSMORE_SHT4X_MEAS_FRAME_LEN];
-  if (!readBytes(buffer, MASSMORE_SHT4X_MEAS_FRAME_LEN)) {
-    return false;
-  }
-  *rawT = (uint16_t)(((uint16_t)buffer[0] << 8) | buffer[1]);
-  *rawRH = (uint16_t)(((uint16_t)buffer[3] << 8) | buffer[4]);
-  return true;
-}
-
-/* ========================================================================= */
-/* CRC-8                                                                     */
-/* ========================================================================= */
-
-uint8_t MassmoreSHT4x::crc8(const uint8_t *data, uint8_t length) {
-  uint8_t crc = MASSMORE_SHT4X_CRC8_INIT;
-  for (uint8_t i = 0; i < length; i++) {
-    crc ^= data[i];
-    for (uint8_t bit = 0; bit < 8; bit++) {
-      if (crc & 0x80) {
-        crc = (uint8_t)((crc << 1) ^ MASSMORE_SHT4X_CRC8_POLYNOMIAL);
-      } else {
-        crc = (uint8_t)(crc << 1);
-      }
-    }
-  }
-  return (uint8_t)(crc ^ MASSMORE_SHT4X_CRC8_FINAL_XOR);
-}
-
-/* ========================================================================= */
-/* การแปลงค่า                                                                */
-/* ========================================================================= */
-
-float MassmoreSHT4x::rawToCelsius(uint16_t raw) {
-  return MASSMORE_SHT4X_T_C_OFFSET +
-         MASSMORE_SHT4X_T_C_SPAN * ((float)raw / MASSMORE_SHT4X_RAW_FULL_SCALE);
-}
-
-float MassmoreSHT4x::rawToFahrenheit(uint16_t raw) {
-  return MASSMORE_SHT4X_T_F_OFFSET +
-         MASSMORE_SHT4X_T_F_SPAN * ((float)raw / MASSMORE_SHT4X_RAW_FULL_SCALE);
-}
-
-float MassmoreSHT4x::rawToHumidity(uint16_t raw) {
-  return MASSMORE_SHT4X_RH_OFFSET +
-         MASSMORE_SHT4X_RH_SPAN * ((float)raw / MASSMORE_SHT4X_RAW_FULL_SCALE);
-}
-
-uint16_t MassmoreSHT4x::celsiusToRaw(float celsius) {
-  float ratio = (celsius - MASSMORE_SHT4X_T_C_OFFSET) / MASSMORE_SHT4X_T_C_SPAN;
-  if (ratio < 0.0f) {
-    ratio = 0.0f;
-  }
-  if (ratio > 1.0f) {
-    ratio = 1.0f;
-  }
-  return (uint16_t)(ratio * MASSMORE_SHT4X_RAW_FULL_SCALE + 0.5f);
-}
-
-uint16_t MassmoreSHT4x::humidityToRaw(float humidity) {
-  float ratio = (humidity - MASSMORE_SHT4X_RH_OFFSET) / MASSMORE_SHT4X_RH_SPAN;
-  if (ratio < 0.0f) {
-    ratio = 0.0f;
-  }
-  if (ratio > 1.0f) {
-    ratio = 1.0f;
-  }
-  return (uint16_t)(ratio * MASSMORE_SHT4X_RAW_FULL_SCALE + 0.5f);
-}
-
-uint8_t MassmoreSHT4x::precisionCommand(massmore_sht4x_precision_t precision) {
-  switch (precision) {
-  case MASSMORE_SHT4X_PRECISION_LOW:
-    return MASSMORE_SHT4X_CMD_MEAS_LOW;
-  case MASSMORE_SHT4X_PRECISION_MEDIUM:
-    return MASSMORE_SHT4X_CMD_MEAS_MED;
-  case MASSMORE_SHT4X_PRECISION_HIGH:
-  default:
-    return MASSMORE_SHT4X_CMD_MEAS_HIGH;
-  }
-}
-
-uint16_t MassmoreSHT4x::precisionDurationMs(massmore_sht4x_precision_t precision) {
-  switch (precision) {
-  case MASSMORE_SHT4X_PRECISION_LOW:
-    return MASSMORE_SHT4X_MEAS_DURATION_LOW_MS;
-  case MASSMORE_SHT4X_PRECISION_MEDIUM:
-    return MASSMORE_SHT4X_MEAS_DURATION_MED_MS;
-  case MASSMORE_SHT4X_PRECISION_HIGH:
-  default:
-    return MASSMORE_SHT4X_MEAS_DURATION_HIGH_MS;
-  }
-}
-
-uint8_t MassmoreSHT4x::heaterCommand(massmore_sht4x_heater_t mode) {
-  switch (mode) {
-  case MASSMORE_SHT4X_HEATER_200MW_1S:
-    return MASSMORE_SHT4X_CMD_HEATER_200MW_1S;
-  case MASSMORE_SHT4X_HEATER_200MW_0S1:
-    return MASSMORE_SHT4X_CMD_HEATER_200MW_0S1;
-  case MASSMORE_SHT4X_HEATER_110MW_1S:
-    return MASSMORE_SHT4X_CMD_HEATER_110MW_1S;
-  case MASSMORE_SHT4X_HEATER_110MW_0S1:
-    return MASSMORE_SHT4X_CMD_HEATER_110MW_0S1;
-  case MASSMORE_SHT4X_HEATER_20MW_1S:
-    return MASSMORE_SHT4X_CMD_HEATER_20MW_1S;
-  case MASSMORE_SHT4X_HEATER_20MW_0S1:
-  default:
-    return MASSMORE_SHT4X_CMD_HEATER_20MW_0S1;
-  }
-}
-
-uint16_t MassmoreSHT4x::heaterPowerMilliwatt(massmore_sht4x_heater_t mode) {
-  switch (mode) {
-  case MASSMORE_SHT4X_HEATER_200MW_1S:
-  case MASSMORE_SHT4X_HEATER_200MW_0S1:
-    return 200;
-  case MASSMORE_SHT4X_HEATER_110MW_1S:
-  case MASSMORE_SHT4X_HEATER_110MW_0S1:
-    return 110;
-  case MASSMORE_SHT4X_HEATER_20MW_1S:
-  case MASSMORE_SHT4X_HEATER_20MW_0S1:
-  default:
-    return 20;
-  }
-}
-
-uint16_t MassmoreSHT4x::heaterDurationMs(massmore_sht4x_heater_t mode) {
-  switch (mode) {
-  case MASSMORE_SHT4X_HEATER_200MW_1S:
-  case MASSMORE_SHT4X_HEATER_110MW_1S:
-  case MASSMORE_SHT4X_HEATER_20MW_1S:
-    return MASSMORE_SHT4X_HEATER_LONG_MS;
-  case MASSMORE_SHT4X_HEATER_200MW_0S1:
-  case MASSMORE_SHT4X_HEATER_110MW_0S1:
-  case MASSMORE_SHT4X_HEATER_20MW_0S1:
-  default:
-    return MASSMORE_SHT4X_HEATER_SHORT_MS;
-  }
-}
-
-const char *MassmoreSHT4x::heaterToString(massmore_sht4x_heater_t mode) {
-  switch (mode) {
-  case MASSMORE_SHT4X_HEATER_200MW_1S:
-    return "200mW/1s";
-  case MASSMORE_SHT4X_HEATER_200MW_0S1:
-    return "200mW/0.1s";
-  case MASSMORE_SHT4X_HEATER_110MW_1S:
-    return "110mW/1s";
-  case MASSMORE_SHT4X_HEATER_110MW_0S1:
-    return "110mW/0.1s";
-  case MASSMORE_SHT4X_HEATER_20MW_1S:
-    return "20mW/1s";
-  case MASSMORE_SHT4X_HEATER_20MW_0S1:
-    return "20mW/0.1s";
-  default:
-    return "ไม่ทราบ";
-  }
-}
-
-/* ========================================================================= */
-/* การเก็บผลวัด                                                               */
-/* ========================================================================= */
-
-void MassmoreSHT4x::storeReading(uint16_t rawT, uint16_t rawRH, bool heated) {
-  float t = rawToCelsius(rawT) + _temperatureOffset;
+void Massmore_SHT4x::storeReading(uint16_t rawT, uint16_t rawRH, bool heated) {
   float h = rawToHumidity(rawRH) + _humidityOffset;
-
-  if (_humidityClipping) {
-    if (h < MASSMORE_SHT4X_RH_MIN_PERCENT) {
-      h = MASSMORE_SHT4X_RH_MIN_PERCENT;
-    }
-    if (h > MASSMORE_SHT4X_RH_MAX_PERCENT) {
-      h = MASSMORE_SHT4X_RH_MAX_PERCENT;
-    }
+  /* datasheet: ค่าอาจเลย 0..100 เล็กน้อย ให้ clip ก่อนใช้งาน */
+  if (h < HUMI_MIN_PERCENT) {
+    h = HUMI_MIN_PERCENT;
+  } else if (h > HUMI_MAX_PERCENT) {
+    h = HUMI_MAX_PERCENT;
   }
-
-  _reading.temperature = t;
+  _reading.temperature = rawToCelsius(rawT) + _temperatureOffset;
   _reading.humidity = h;
   _reading.rawTemperature = rawT;
   _reading.rawHumidity = rawRH;
@@ -478,732 +179,600 @@ void MassmoreSHT4x::storeReading(uint16_t rawT, uint16_t rawRH, bool heated) {
   _reading.heated = heated;
 }
 
-/* ========================================================================= */
-/* การวัดแบบบล็อก                                                             */
-/* ========================================================================= */
-
-bool MassmoreSHT4x::measureWith(massmore_sht4x_precision_t precision,
-                                float *temperature, float *humidity) {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-  if (_mode == MASSMORE_SHT4X_MODE_HEATING && !isHeaterDone()) {
-    return setError(MASSMORE_SHT4X_ERR_WRONG_MODE);
-  }
-
-  uint16_t rawT = 0;
-  uint16_t rawRH = 0;
-  if (!commandAndRead(precisionCommand(precision), precisionDurationMs(precision),
-                      &rawT, &rawRH)) {
-    return false;
-  }
-
-  storeReading(rawT, rawRH, false);
-  _mode = MASSMORE_SHT4X_MODE_READY;
-
-  if (temperature != nullptr) {
-    *temperature = _reading.temperature;
-  }
-  if (humidity != nullptr) {
-    *humidity = _reading.humidity;
-  }
-  clearError();
-  return true;
-}
-
-bool MassmoreSHT4x::measure(float *temperature, float *humidity) {
-  return measureWith(_precision, temperature, humidity);
-}
-
-bool MassmoreSHT4x::measure(massmore_sht4x_reading_t &reading) {
-  if (!measureWith(_precision, nullptr, nullptr)) {
-    return false;
-  }
-  reading = _reading;
-  return true;
-}
-
-float MassmoreSHT4x::readTemperature() {
-  float t = NAN;
-  if (!measure(&t, nullptr)) {
-    return NAN;
-  }
-  return t;
-}
-
-float MassmoreSHT4x::readTemperatureF() {
-  float t = readTemperature();
-  if (isnan(t)) {
-    return NAN;
-  }
-  return celsiusToFahrenheit(t);
-}
-
-float MassmoreSHT4x::readHumidity() {
-  float h = NAN;
-  if (!measure(nullptr, &h)) {
-    return NAN;
-  }
-  return h;
-}
-
-/* ========================================================================= */
-/* การวัดแบบไม่บล็อก                                                          */
-/* ========================================================================= */
-
-bool MassmoreSHT4x::startMeasurement() {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-  if (_mode == MASSMORE_SHT4X_MODE_HEATING && !isHeaterDone()) {
-    return setError(MASSMORE_SHT4X_ERR_WRONG_MODE);
-  }
-  if (!sendCommand(precisionCommand(_precision))) {
-    return false;
-  }
-  _operationStartMs = millis();
-  _operationDurationMs = precisionDurationMs(_precision);
-  _pendingHeated = false;
-  _mode = MASSMORE_SHT4X_MODE_MEASURING;
-  clearError();
-  return true;
-}
-
-bool MassmoreSHT4x::isMeasurementReady() const {
-  if (_mode != MASSMORE_SHT4X_MODE_MEASURING && _mode != MASSMORE_SHT4X_MODE_HEATING) {
-    return false;
-  }
-  return (uint32_t)(millis() - _operationStartMs) >= _operationDurationMs;
-}
-
-bool MassmoreSHT4x::isHeaterDone() const {
-  if (_mode != MASSMORE_SHT4X_MODE_HEATING) {
-    return true;
-  }
-  return (uint32_t)(millis() - _operationStartMs) >= _operationDurationMs;
-}
-
-bool MassmoreSHT4x::readMeasurement(float *temperature, float *humidity) {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-  if (_mode != MASSMORE_SHT4X_MODE_MEASURING && _mode != MASSMORE_SHT4X_MODE_HEATING) {
-    return setError(MASSMORE_SHT4X_ERR_WRONG_MODE);
-  }
-  if (!isMeasurementReady()) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_READY);
-  }
-
-  uint16_t rawT = 0;
-  uint16_t rawRH = 0;
-  if (!readFrame(&rawT, &rawRH)) {
-    /* ชิป NACK = ยังวัดไม่เสร็จจริง ๆ ให้ผู้ใช้ลองใหม่ ไม่ใช่ความเสียหาย */
-    if (_error == MASSMORE_SHT4X_ERR_I2C_READ) {
-      return setError(MASSMORE_SHT4X_ERR_NOT_READY);
-    }
-    return false;
-  }
-
-  storeReading(rawT, rawRH, _pendingHeated);
-  _mode = MASSMORE_SHT4X_MODE_READY;
-
-  if (temperature != nullptr) {
-    *temperature = _reading.temperature;
-  }
-  if (humidity != nullptr) {
-    *humidity = _reading.humidity;
-  }
-  clearError();
-  return true;
-}
-
-bool MassmoreSHT4x::readMeasurement(massmore_sht4x_reading_t &reading) {
-  if (!readMeasurement(nullptr, nullptr)) {
-    return false;
-  }
-  reading = _reading;
-  return true;
-}
-
-void MassmoreSHT4x::setUpdateInterval(uint32_t intervalMs) {
-  _updateIntervalMs = intervalMs;
-}
-
-uint32_t MassmoreSHT4x::getUpdateInterval() const { return _updateIntervalMs; }
-
-bool MassmoreSHT4x::update() {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-
-  /* กำลังรอผลอยู่ ถ้าครบเวลาแล้วก็เก็บผล */
-  if (_mode == MASSMORE_SHT4X_MODE_MEASURING || _mode == MASSMORE_SHT4X_MODE_HEATING) {
-    if (!isMeasurementReady()) {
-      return false;
-    }
-    if (!readMeasurement(nullptr, nullptr)) {
-      return false;
-    }
-    if (_callback != nullptr) {
-      _callback(_reading);
-    }
-    return true;
-  }
-
-  /* ว่างอยู่ ถ้าถึงรอบถัดไปแล้วก็สั่งวัดใหม่ */
-  uint32_t now = millis();
-  if (_reading.timestampMs != 0 &&
-      (uint32_t)(now - _lastUpdateStartMs) < _updateIntervalMs) {
-    return false;
-  }
-  _lastUpdateStartMs = now;
-  startMeasurement();
+bool Massmore_SHT4x::setError(ErrorCode error) {
+  _error = error;
   return false;
 }
 
-massmore_sht4x_mode_t MassmoreSHT4x::getMode() const { return _mode; }
-
-void MassmoreSHT4x::setCallback(massmore_sht4x_callback_t callback) {
-  _callback = callback;
-}
-
 /* ========================================================================= */
-/* ค่าล่าสุด                                                                  */
+/* Simple Blocking API                                                       */
 /* ========================================================================= */
 
-float MassmoreSHT4x::getTemperature() const { return _reading.temperature; }
-
-float MassmoreSHT4x::getTemperatureF() const {
-  if (isnan(_reading.temperature)) {
+float Massmore_SHT4x::readTemperature(Precision precision) {
+  if (!measureBlocking(precisionCommand(precision), precisionDurationMs(precision),
+                       false)) {
     return NAN;
   }
-  return celsiusToFahrenheit(_reading.temperature);
+  return _reading.temperature;
 }
 
-float MassmoreSHT4x::getHumidity() const { return _reading.humidity; }
-
-uint16_t MassmoreSHT4x::getRawTemperature() const { return _reading.rawTemperature; }
-
-uint16_t MassmoreSHT4x::getRawHumidity() const { return _reading.rawHumidity; }
-
-uint32_t MassmoreSHT4x::getLastUpdateMs() const { return _reading.timestampMs; }
-
-const massmore_sht4x_reading_t &MassmoreSHT4x::getLastReading() const {
-  return _reading;
+float Massmore_SHT4x::readHumidity(Precision precision) {
+  if (!measureBlocking(precisionCommand(precision), precisionDurationMs(precision),
+                       false)) {
+    return NAN;
+  }
+  return _reading.humidity;
 }
 
-/* ========================================================================= */
-/* ฮีตเตอร์                                                                   */
-/* ========================================================================= */
-
-bool MassmoreSHT4x::heaterDutyAllows(uint16_t durationMs) const {
-  if (!_heaterDutyGuard) {
-    return true;
-  }
-  uint32_t elapsed = (uint32_t)(millis() - _heaterEpochMs);
-  uint32_t wouldBeOn = _heaterOnTimeMs + durationMs;
-
-  /*
-   * ช่วงแรกหลัง begin() เวลายังผ่านไปน้อย ยอมให้ยิงพัลส์แรกได้เสมอ
-   * มิฉะนั้นการเรียก runHeater() ทันทีหลัง begin() จะถูกปฏิเสธเสมอ
-   */
-  if (elapsed < 2000UL) {
-    return _heaterOnTimeMs == 0;
-  }
-  /* on / elapsed <= 10%  เขียนแบบคูณไขว้เพื่อเลี่ยงเลขทศนิยม */
-  return (wouldBeOn * 100UL) <= (elapsed * MASSMORE_SHT4X_HEATER_MAX_DUTY_PERCENT);
-}
-
-void MassmoreSHT4x::accountHeater(uint16_t durationMs) {
-  _heaterOnTimeMs += durationMs;
-}
-
-bool MassmoreSHT4x::runHeater(massmore_sht4x_heater_t mode,
-                              massmore_sht4x_reading_t *reading) {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-  uint16_t duration = heaterDurationMs(mode);
-  if (!heaterDutyAllows(duration)) {
-    return setError(MASSMORE_SHT4X_ERR_HEATER_DUTY);
-  }
-
-  uint16_t rawT = 0;
-  uint16_t rawRH = 0;
-  if (!commandAndRead(heaterCommand(mode), duration, &rawT, &rawRH)) {
+bool Massmore_SHT4x::readAll(Readings &out, Precision precision) {
+  if (!measureBlocking(precisionCommand(precision), precisionDurationMs(precision),
+                       false)) {
     return false;
   }
-  accountHeater(duration);
-
-  storeReading(rawT, rawRH, true);
-  _mode = MASSMORE_SHT4X_MODE_READY;
-  if (reading != nullptr) {
-    *reading = _reading;
-  }
-  clearError();
+  out = _reading;
   return true;
 }
 
-bool MassmoreSHT4x::startHeater(massmore_sht4x_heater_t mode) {
+bool Massmore_SHT4x::readAll(float &temperature, float &humidity,
+                             Precision precision) {
+  if (!measureBlocking(precisionCommand(precision), precisionDurationMs(precision),
+                       false)) {
+    temperature = NAN;
+    humidity = NAN;
+    return false;
+  }
+  temperature = _reading.temperature;
+  humidity = _reading.humidity;
+  return true;
+}
+
+/* ========================================================================= */
+/* Non-blocking FSM                                                          */
+/* ========================================================================= */
+
+bool Massmore_SHT4x::requestConversion(Precision precision) {
   if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
+    return setError(ErrorCode::NOT_BEGUN);
+  }
+  if (_state == State::MEASURING || _state == State::HEATING) {
+    return setError(ErrorCode::BUSY);
+  }
+  if (!sendCommand(precisionCommand(precision))) {
+    return false;
+  }
+  _opStartMs = millis();
+  _opDurationMs = precisionDurationMs(precision);
+  _opHeated = false;
+  _state = State::MEASURING;
+  _error = ErrorCode::OK;
+  return true;
+}
+
+bool Massmore_SHT4x::requestHeater(HeaterMode mode) {
+  if (!_begun) {
+    return setError(ErrorCode::NOT_BEGUN);
+  }
+  if (_state == State::MEASURING || _state == State::HEATING) {
+    return setError(ErrorCode::BUSY);
   }
   uint16_t duration = heaterDurationMs(mode);
-  if (!heaterDutyAllows(duration)) {
-    return setError(MASSMORE_SHT4X_ERR_HEATER_DUTY);
+  if (!heaterAllowed(duration)) {
+    return setError(ErrorCode::HEATER_DUTY);
   }
   if (!sendCommand(heaterCommand(mode))) {
     return false;
   }
   accountHeater(duration);
-  _operationStartMs = millis();
-  _operationDurationMs = duration;
-  _pendingHeated = true;
-  _mode = MASSMORE_SHT4X_MODE_HEATING;
-  clearError();
+  _opStartMs = millis();
+  _opDurationMs = duration;
+  _opHeated = true;
+  _state = State::HEATING;
+  _error = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreSHT4x::removeCondensation(uint8_t pulses, uint32_t restMs) {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-  if (pulses == 0) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-
-  bool guardWas = _heaterDutyGuard;
-  /*
-   * ระหว่างกู้สถานการณ์เราเว้นจังหวะพักเองด้วย restMs อยู่แล้ว
-   * จึงปิดตัวกันเผลอชั่วคราวแล้วเปิดคืนตอนจบ
-   */
-  _heaterDutyGuard = false;
-  bool ok = true;
-  for (uint8_t i = 0; i < pulses; i++) {
-    if (!runHeater(MASSMORE_SHT4X_HEATER_200MW_1S, nullptr)) {
-      ok = false;
-      break;
-    }
-    if (i + 1 < pulses) {
-      delay(restMs);
-    }
-  }
-  _heaterDutyGuard = guardWas;
-  return ok;
-}
-
-bool MassmoreSHT4x::measureAfterHeating(uint32_t coolDownMs,
-                                        massmore_sht4x_reading_t &reading) {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-  delay(coolDownMs);
-  return measure(reading);
-}
-
-void MassmoreSHT4x::setHeaterDutyGuard(bool enabled) { _heaterDutyGuard = enabled; }
-
-bool MassmoreSHT4x::getHeaterDutyGuard() const { return _heaterDutyGuard; }
-
-float MassmoreSHT4x::getHeaterDutyPercent() const {
-  uint32_t elapsed = (uint32_t)(millis() - _heaterEpochMs);
-  if (elapsed == 0) {
-    return 0.0f;
-  }
-  return 100.0f * ((float)_heaterOnTimeMs / (float)elapsed);
-}
-
-uint32_t MassmoreSHT4x::getHeaterOnTimeMs() const { return _heaterOnTimeMs; }
-
-void MassmoreSHT4x::resetHeaterStats() {
-  _heaterOnTimeMs = 0;
-  _heaterEpochMs = millis();
-}
-
-/* ========================================================================= */
-/* รีเซ็ต                                                                     */
-/* ========================================================================= */
-
-bool MassmoreSHT4x::softReset() {
-  if (!sendCommand(MASSMORE_SHT4X_CMD_SOFT_RESET)) {
+bool Massmore_SHT4x::update() {
+  if (_state != State::MEASURING && _state != State::HEATING) {
     return false;
   }
-  delay(MASSMORE_SHT4X_SOFT_RESET_MS);
-  _mode = _begun ? MASSMORE_SHT4X_MODE_READY : _mode;
-  clearError();
+  uint32_t elapsed = (uint32_t)(millis() - _opStartMs);
+  if (elapsed < _opDurationMs) {
+    return false; /* ยังไม่ถึงเวลา ไม่แตะ Bus */
+  }
+
+  uint16_t rawT = 0;
+  uint16_t rawRH = 0;
+  if (readFrame(rawT, rawRH)) {
+    storeReading(rawT, rawRH, _opHeated);
+    _state = State::DATA_READY;
+    _error = ErrorCode::OK;
+    return true;
+  }
+  if (_error == ErrorCode::NOT_READY) {
+    /* ชิปยัง NACK: รอต่อจนกว่าจะเกิน timeout */
+    if (elapsed >= (uint32_t)_opDurationMs + _timeoutMs) {
+      _state = State::IDLE;
+      setError(ErrorCode::TIMEOUT);
+    }
+    return false;
+  }
+  /* CRC_FAIL หรือ Bus error: ยกเลิกงานนี้ */
+  _state = State::IDLE;
+  return false;
+}
+
+bool Massmore_SHT4x::isDataReady() const { return _state == State::DATA_READY; }
+
+bool Massmore_SHT4x::getReadings(Readings &out) {
+  if (_state != State::DATA_READY) {
+    return setError(ErrorCode::NOT_READY);
+  }
+  out = _reading;
+  _state = State::IDLE;
+  _error = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreSHT4x::generalCallReset() {
-  if (_wire == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
-  }
-  _wire->beginTransmission(MASSMORE_SHT4X_GENERAL_CALL_ADDR);
-  _wire->write((uint8_t)MASSMORE_SHT4X_GENERAL_CALL_RESET_BYTE);
-  if (_wire->endTransmission() != 0) {
-    return setError(MASSMORE_SHT4X_ERR_I2C_WRITE);
-  }
-  delay(MASSMORE_SHT4X_SOFT_RESET_MS);
-  _mode = _begun ? MASSMORE_SHT4X_MODE_READY : _mode;
-  clearError();
-  return true;
+Massmore_SHT4x::State Massmore_SHT4x::getState() const { return _state; }
+
+const Massmore_SHT4x::Readings &Massmore_SHT4x::lastReadings() const {
+  return _reading;
 }
 
 /* ========================================================================= */
-/* ตัวตนของชิป                                                                */
+/* Heater                                                                    */
 /* ========================================================================= */
 
-bool MassmoreSHT4x::readSerialNumber(uint32_t *serial) {
-  if (serial == nullptr) {
-    return setError(MASSMORE_SHT4X_ERR_BAD_ARG);
+bool Massmore_SHT4x::runHeater(HeaterMode mode, Readings *out) {
+  if (!_begun) {
+    return setError(ErrorCode::NOT_BEGUN);
   }
+  uint16_t duration = heaterDurationMs(mode);
+  if (!heaterAllowed(duration)) {
+    return setError(ErrorCode::HEATER_DUTY);
+  }
+  /* นับ duty ก่อนยิง เพราะถึงอ่านผลไม่สำเร็จ Heater ก็ทำงานไปแล้ว */
+  accountHeater(duration);
+  if (!measureBlocking(heaterCommand(mode), duration, true)) {
+    return false;
+  }
+  if (out != nullptr) {
+    *out = _reading;
+  }
+  return true;
+}
+
+void Massmore_SHT4x::setHeaterDutyGuard(bool enabled) { _dutyGuard = enabled; }
+
+/*
+ * duty-cycle guard: datasheet กำหนดให้ใช้ Heater ที่ duty cycle < 10 %
+ * กติกาที่ใช้: หลังจบ pulse ยาว d ms ต้องพัก >= 9·d ms ก่อนยิงครั้งถัดไป
+ * (pulse แรกหลัง begin() ยิงได้ทันที)
+ */
+bool Massmore_SHT4x::heaterAllowed(uint16_t durationMs) const {
+  (void)durationMs;
+  if (!_dutyGuard) {
+    return true;
+  }
+  return heaterCooldownRemainingMs() == 0;
+}
+
+uint32_t Massmore_SHT4x::heaterCooldownRemainingMs() const {
+  if (!_dutyGuard || !_heaterUsed) {
+    return 0;
+  }
+  uint32_t required = (uint32_t)_heaterLastDurationMs *
+                      (uint32_t)((100 / HEATER_MAX_DUTY_PERCENT) - 1);
+  uint32_t since = (uint32_t)(millis() - _heaterEndMs);
+  return (since >= required) ? 0 : (required - since);
+}
+
+void Massmore_SHT4x::accountHeater(uint16_t durationMs) {
+  _heaterUsed = true;
+  _heaterLastDurationMs = durationMs;
+  _heaterEndMs = millis() + durationMs;
+}
+
+uint16_t Massmore_SHT4x::heaterPowerMilliwatt(HeaterMode mode) {
+  switch (mode) {
+  case HeaterMode::MW200_1S:
+  case HeaterMode::MW200_100MS:
+    return 200;
+  case HeaterMode::MW110_1S:
+  case HeaterMode::MW110_100MS:
+    return 110;
+  default:
+    return 20;
+  }
+}
+
+uint16_t Massmore_SHT4x::heaterDurationMs(HeaterMode mode) {
+  switch (mode) {
+  case HeaterMode::MW200_1S:
+  case HeaterMode::MW110_1S:
+  case HeaterMode::MW20_1S:
+    return HEATER_LONG_MS;
+  default:
+    return HEATER_SHORT_MS;
+  }
+}
+
+uint8_t Massmore_SHT4x::heaterCommand(HeaterMode mode) {
+  switch (mode) {
+  case HeaterMode::MW200_1S:
+    return CMD_HEATER_200MW_1S;
+  case HeaterMode::MW200_100MS:
+    return CMD_HEATER_200MW_0S1;
+  case HeaterMode::MW110_1S:
+    return CMD_HEATER_110MW_1S;
+  case HeaterMode::MW110_100MS:
+    return CMD_HEATER_110MW_0S1;
+  case HeaterMode::MW20_1S:
+    return CMD_HEATER_20MW_1S;
+  default:
+    return CMD_HEATER_20MW_0S1;
+  }
+}
+
+/* ========================================================================= */
+/* Chip identity                                                             */
+/* ========================================================================= */
+
+bool Massmore_SHT4x::readSerialNumber(uint32_t &serial) {
+  if (!sendCommand(CMD_READ_SERIAL)) {
+    return false;
+  }
+  delay(SERIAL_READ_MS);
   uint16_t high = 0;
   uint16_t low = 0;
-  if (!commandAndRead(MASSMORE_SHT4X_CMD_READ_SERIAL, MASSMORE_SHT4X_SERIAL_READ_MS,
-                      &high, &low)) {
+  if (!readFrameWithRetry(high, low, _timeoutMs)) {
     return false;
   }
-  _serialNumber = ((uint32_t)high << 16) | (uint32_t)low;
-  *serial = _serialNumber;
-  clearError();
+  serial = ((uint32_t)high << 16) | (uint32_t)low;
+  _serialNumber = serial;
+  _error = ErrorCode::OK;
   return true;
 }
 
-uint32_t MassmoreSHT4x::getSerialNumber() const { return _serialNumber; }
+uint32_t Massmore_SHT4x::getSerialNumber() const { return _serialNumber; }
 
-massmore_sht4x_genuine_t MassmoreSHT4x::verifyChip() {
-  _verifyMask = 0;
-  _genuine = MASSMORE_SHT4X_GENUINE_UNKNOWN;
-
-  /* --- ข้อ 1: มีอุปกรณ์ตอบที่ address นี้ไหม --- */
-  if (!isConnected()) {
-    _genuine = MASSMORE_SHT4X_GENUINE_NOT_SHT4X;
-    return _genuine;
+bool Massmore_SHT4x::verifyChipID() {
+  uint32_t serial = 0;
+  if (!readSerialNumber(serial)) {
+    return false;
   }
-  _verifyMask |= MASSMORE_SHT4X_CHK_ACK;
+  if (serial == 0x00000000UL || serial == 0xFFFFFFFFUL) {
+    return setError(ErrorCode::WRONG_ID);
+  }
+  return true;
+}
+
+bool Massmore_SHT4x::isGenuine() {
+  _genuineMask = 0;
+
+  /* 1. ACK ที่ address */
+  if (!isConnected()) {
+    return false;
+  }
+  _genuineMask |= CHK_ACK;
 
   bool wasBegun = _begun;
+  State wasState = _state;
   _begun = true;
-  _mode = MASSMORE_SHT4X_MODE_READY;
+  _state = State::IDLE;
 
-  /* --- ข้อ 2-3: อ่านซีเรียลจากโรงงาน --- */
+  /* 2-3. Serial + CRC และค่าต้องสมเหตุสมผล */
   uint32_t serial1 = 0;
-  bool serialOk = readSerialNumber(&serial1);
+  bool serialOk = readSerialNumber(serial1);
   if (serialOk) {
-    _verifyMask |= MASSMORE_SHT4X_CHK_SERIAL_CRC;
+    _genuineMask |= CHK_SERIAL_CRC;
     if (serial1 != 0x00000000UL && serial1 != 0xFFFFFFFFUL) {
-      _verifyMask |= MASSMORE_SHT4X_CHK_SERIAL_SANE;
+      _genuineMask |= CHK_SERIAL_SANE;
     }
   }
 
-  /* --- ข้อ 4: อ่านซ้ำต้องได้ค่าเดิม --- */
-  delay(MASSMORE_SHT4X_CMD_GAP_MS);
+  /* 4. อ่านซ้ำต้องได้ค่าเดิม */
   uint32_t serial2 = 0;
-  if (serialOk && readSerialNumber(&serial2) && serial2 == serial1) {
-    _verifyMask |= MASSMORE_SHT4X_CHK_SERIAL_STABLE;
+  if (serialOk && readSerialNumber(serial2) && serial2 == serial1) {
+    _genuineMask |= CHK_SERIAL_STABLE;
   }
   _serialNumber = serial1;
 
-  /* --- ข้อ 5: soft reset แล้วยังวัดได้ --- */
+  /* 5-7. soft reset แล้ววัดต่อได้, CRC ถูก, ค่าอยู่ในช่วง */
   bool resetOk = softReset();
-  delay(MASSMORE_SHT4X_CMD_GAP_MS);
-  float t = NAN;
-  float h = NAN;
-  bool measOk = measureWith(MASSMORE_SHT4X_PRECISION_HIGH, &t, &h);
+  bool measOk = measureBlocking(CMD_MEAS_HIGH, MEAS_HIGH_MS, false);
   if (resetOk && measOk) {
-    _verifyMask |= MASSMORE_SHT4X_CHK_SOFT_RESET;
+    _genuineMask |= CHK_SOFT_RESET;
   }
-
-  /* --- ข้อ 6-7: CRC ของผลวัด และความสมเหตุสมผลของค่า --- */
   if (measOk) {
-    _verifyMask |= MASSMORE_SHT4X_CHK_MEAS_CRC;
+    _genuineMask |= CHK_MEAS_CRC;
     bool rawSane = (_reading.rawTemperature != 0x0000) &&
                    (_reading.rawTemperature != 0xFFFF) &&
                    (_reading.rawHumidity != 0xFFFF);
-    if (rawSane && t > MASSMORE_SHT4X_T_MIN_C && t < MASSMORE_SHT4X_T_MAX_C &&
-        h >= MASSMORE_SHT4X_RH_MIN_PERCENT && h <= MASSMORE_SHT4X_RH_MAX_PERCENT) {
-      _verifyMask |= MASSMORE_SHT4X_CHK_MEAS_RANGE;
+    float t = rawToCelsius(_reading.rawTemperature);
+    float h = rawToHumidity(_reading.rawHumidity);
+    if (rawSane && t > TEMP_MIN_C && t < TEMP_MAX_C && h > -6.0f && h < 119.0f) {
+      _genuineMask |= CHK_MEAS_RANGE;
     }
   }
 
   /*
-   * --- ข้อ 8: อ่านผลก่อนวัดเสร็จ ชิปแท้ต้อง NACK ---
-   * datasheet: "The sensor does not support clock-stretching ... it will return
-   * a NACK" ของเลียนแบบที่ทำเป็นตารางค่าคงที่มักตอบทันที จึงตกข้อนี้
+   * 8. อ่านก่อนวัดเสร็จ ชิปต้อง NACK
+   * datasheet §4.3: "The sensor does not support clock-stretching ...
+   * it will return a NACK" ของเลียนแบบที่ตอบจากตารางค่ามักตอบทันที
    */
-  if (sendCommand(MASSMORE_SHT4X_CMD_MEAS_HIGH)) {
+  if (sendCommand(CMD_MEAS_HIGH)) {
     delay(MASSMORE_SHT4X_PROBE_EARLY_MS);
-    uint8_t probe[MASSMORE_SHT4X_MEAS_FRAME_LEN];
-    bool early = readBytes(probe, MASSMORE_SHT4X_MEAS_FRAME_LEN);
-    if (!early) {
-      _verifyMask |= MASSMORE_SHT4X_CHK_NACK_EARLY;
+    uint16_t a = 0;
+    uint16_t b = 0;
+    if (!readFrame(a, b) && _error == ErrorCode::NOT_READY) {
+      _genuineMask |= CHK_NACK_EARLY;
     }
-    /* รอให้ครบเวลาแล้วเก็บผลทิ้ง เพื่อไม่ให้ค้างคาบัส */
-    delay(MASSMORE_SHT4X_MEAS_DURATION_HIGH_MS);
-    uint16_t dummyT = 0;
-    uint16_t dummyRH = 0;
-    readFrame(&dummyT, &dummyRH);
+    /* เก็บผลทิ้งเพื่อไม่ให้ค้าง */
+    delay(MEAS_HIGH_MS);
+    readFrameWithRetry(a, b, _timeoutMs);
   }
 
-  /* --- ข้อ 9: ความละเอียดต่ำต้องเสร็จเร็วกว่าความละเอียดสูงจริง --- */
-  delay(MASSMORE_SHT4X_CMD_GAP_MS);
-  if (sendCommand(MASSMORE_SHT4X_CMD_MEAS_LOW)) {
-    delay(MASSMORE_SHT4X_MEAS_DURATION_LOW_MS);
-    uint16_t lowT = 0;
-    uint16_t lowRH = 0;
-    if (readFrame(&lowT, &lowRH)) {
-      /* ต้องอ่านได้ที่ 3 ms ซึ่งเป็นเวลาที่คำสั่งความละเอียดสูงยังไม่เสร็จ */
-      _verifyMask |= MASSMORE_SHT4X_CHK_LOW_FASTER;
+  /* 9. LOW_RES ต้องเสร็จภายใน 2 ms ซึ่ง HIGH_RES ยังไม่เสร็จแน่นอน */
+  if (sendCommand(CMD_MEAS_LOW)) {
+    delay(MEAS_LOW_MS);
+    uint16_t a = 0;
+    uint16_t b = 0;
+    if (readFrame(a, b)) {
+      _genuineMask |= CHK_LOW_FASTER;
+    } else {
+      delay(MEAS_HIGH_MS);
+      readFrameWithRetry(a, b, _timeoutMs);
     }
   }
 
-  /* --- ข้อ 10: คำสั่งนอกตารางต้องไม่ถูกตอบด้วยข้อมูล --- */
-  delay(MASSMORE_SHT4X_CMD_GAP_MS);
-  bool bogusAnswered = false;
-  if (sendCommand(MASSMORE_SHT4X_CMD_BOGUS)) {
-    delay(MASSMORE_SHT4X_MEAS_DURATION_HIGH_MS);
-    uint8_t probe[MASSMORE_SHT4X_MEAS_FRAME_LEN];
-    bogusAnswered = readBytes(probe, MASSMORE_SHT4X_MEAS_FRAME_LEN);
-  }
-  if (!bogusAnswered) {
-    _verifyMask |= MASSMORE_SHT4X_CHK_BOGUS_CMD;
-  }
-
-  /* คืนสภาพเดิม */
+  /* คืนสภาพ */
   softReset();
   _begun = wasBegun;
-  _mode = wasBegun ? MASSMORE_SHT4X_MODE_READY : MASSMORE_SHT4X_MODE_IDLE;
-  clearError();
+  _state = (wasState == State::DATA_READY) ? State::DATA_READY : State::IDLE;
+  _error = ErrorCode::OK;
 
-  /* --- สรุปผล --- */
-  uint8_t passed = getVerifyPassCount();
-  /*
-   * แกนกลางที่ตัดสินว่า "เป็น SHT4x หรือไม่ใช่เลย" คือซีเรียลกับ CRC ของผลวัด
-   * ชิปตระกูลอื่นที่ใช้ address 0x44 เหมือนกัน (เช่น SHT3x หรือ AHT2x)
-   * จะตอบคำสั่ง 1 ไบต์แบบนี้ไม่ได้ จึงตกสองข้อนี้
-   */
-  bool coreOk = (_verifyMask & MASSMORE_SHT4X_CHK_SERIAL_CRC) &&
-                (_verifyMask & MASSMORE_SHT4X_CHK_MEAS_CRC);
-  if (!coreOk) {
-    _genuine = MASSMORE_SHT4X_GENUINE_NOT_SHT4X;
-  } else if (passed == MASSMORE_SHT4X_CHK_COUNT) {
-    _genuine = MASSMORE_SHT4X_GENUINE_PASS;
-  } else if (passed >= 8) {
-    _genuine = MASSMORE_SHT4X_GENUINE_PARTIAL;
-  } else {
-    _genuine = MASSMORE_SHT4X_GENUINE_SUSPECT;
-  }
-  return _genuine;
+  return (_genuineMask & CHK_ALL) == CHK_ALL;
 }
 
-uint16_t MassmoreSHT4x::getVerifyMask() const { return _verifyMask; }
+uint16_t Massmore_SHT4x::getGenuineMask() const { return _genuineMask; }
 
-uint8_t MassmoreSHT4x::getVerifyPassCount() const {
-  uint8_t count = 0;
-  for (uint8_t i = 0; i < MASSMORE_SHT4X_CHK_COUNT; i++) {
-    if (_verifyMask & (1u << i)) {
-      count++;
+uint8_t Massmore_SHT4x::getGenuinePassCount() const {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < CHK_COUNT; i++) {
+    if (_genuineMask & (1u << i)) {
+      n++;
     }
   }
-  return count;
+  return n;
 }
 
-const char *MassmoreSHT4x::getVerifyCheckName(uint8_t index) {
+const char *Massmore_SHT4x::genuineCheckName(uint8_t index) {
   switch (index) {
   case 0:
-    return "ตอบ ACK ที่ address";
+    return "I2C_ACK";
   case 1:
-    return "CRC ของซีเรียล";
+    return "SERIAL_CRC";
   case 2:
-    return "ซีเรียลไม่ใช่ค่าว่าง";
+    return "SERIAL_SANE";
   case 3:
-    return "อ่านซีเรียลซ้ำได้ค่าเดิม";
+    return "SERIAL_STABLE";
   case 4:
-    return "soft reset แล้ววัดต่อได้";
+    return "SOFT_RESET";
   case 5:
-    return "CRC ของผลวัด";
+    return "MEAS_CRC";
   case 6:
-    return "ค่าที่วัดอยู่ในช่วง";
+    return "MEAS_RANGE";
   case 7:
-    return "NACK ตอนยังวัดไม่เสร็จ";
+    return "NACK_WHILE_BUSY";
   case 8:
-    return "ความละเอียดต่ำเสร็จเร็วกว่า";
-  case 9:
-    return "ปฏิเสธคำสั่งนอกตาราง";
+    return "LOW_RES_FASTER";
   default:
-    return "ไม่ทราบ";
-  }
-}
-
-const char *MassmoreSHT4x::genuineToString(massmore_sht4x_genuine_t result) {
-  switch (result) {
-  case MASSMORE_SHT4X_GENUINE_PASS:
-    return "ของแท้ Sensirion SHT4x";
-  case MASSMORE_SHT4X_GENUINE_PARTIAL:
-    return "น่าจะแท้ แต่มีบางข้อไม่ผ่าน";
-  case MASSMORE_SHT4X_GENUINE_SUSPECT:
-    return "น่าสงสัย ตอบผิดหลายข้อ";
-  case MASSMORE_SHT4X_GENUINE_NOT_SHT4X:
-    return "ไม่ใช่ SHT4x";
-  case MASSMORE_SHT4X_GENUINE_UNKNOWN:
-  default:
-    return "ยังไม่ได้ตรวจ";
+    return "UNKNOWN";
   }
 }
 
 /* ========================================================================= */
-/* self test                                                                 */
+/* Reset                                                                     */
 /* ========================================================================= */
 
-bool MassmoreSHT4x::runHeaterSelfTest(massmore_sht4x_heater_t mode, float minRiseC,
-                                      float *riseOut) {
-  if (!_begun) {
-    return setError(MASSMORE_SHT4X_ERR_NOT_BEGUN);
-  }
-
-  float before = NAN;
-  if (!measureWith(MASSMORE_SHT4X_PRECISION_HIGH, &before, nullptr)) {
+bool Massmore_SHT4x::softReset() {
+  if (!sendCommand(CMD_SOFT_RESET)) {
     return false;
   }
+  delay(SOFT_RESET_MS);
+  _state = State::IDLE;
+  _error = ErrorCode::OK;
+  return true;
+}
 
-  massmore_sht4x_reading_t hot;
-  if (!runHeater(mode, &hot)) {
-    return false;
+bool Massmore_SHT4x::generalCallReset() {
+  _wire->beginTransmission(GENERAL_CALL_ADDR);
+  _wire->write(GENERAL_CALL_RESET);
+  if (_wire->endTransmission() != 0) {
+    return setError(ErrorCode::BUS_ERROR);
   }
-
-  float rise = hot.temperature - before;
-  if (riseOut != nullptr) {
-    *riseOut = rise;
-  }
-  if (rise < minRiseC) {
-    return setError(MASSMORE_SHT4X_ERR_OUT_OF_RANGE);
-  }
-  clearError();
+  delay(SOFT_RESET_MS);
+  _state = State::IDLE;
+  _error = ErrorCode::OK;
   return true;
 }
 
 /* ========================================================================= */
-/* ค่าที่คำนวณต่อ                                                             */
+/* Configuration                                                             */
 /* ========================================================================= */
 
-float MassmoreSHT4x::celsiusToFahrenheit(float celsius) {
-  return celsius * 9.0f / 5.0f + 32.0f;
+void Massmore_SHT4x::setTemperatureOffset(float offsetC) { _temperatureOffset = offsetC; }
+void Massmore_SHT4x::setHumidityOffset(float offsetPercent) {
+  _humidityOffset = offsetPercent;
+}
+float Massmore_SHT4x::getTemperatureOffset() const { return _temperatureOffset; }
+float Massmore_SHT4x::getHumidityOffset() const { return _humidityOffset; }
+
+void Massmore_SHT4x::setVariant(Variant variant) { _variant = variant; }
+Massmore_SHT4x::Variant Massmore_SHT4x::getVariant() const { return _variant; }
+
+const char *Massmore_SHT4x::getVariantName() const {
+  switch (_variant) {
+  case Variant::SHT40:
+    return "SHT40";
+  case Variant::SHT41:
+    return "SHT41";
+  case Variant::SHT45:
+    return "SHT45";
+  default:
+    return "SHT4x";
+  }
 }
 
-float MassmoreSHT4x::fahrenheitToCelsius(float fahrenheit) {
-  return (fahrenheit - 32.0f) * 5.0f / 9.0f;
+/* accuracy typ. จาก datasheet ตาราง "Humidity/Temperature sensor specifications" */
+float Massmore_SHT4x::getTemperatureAccuracy() const {
+  return (_variant == Variant::SHT45) ? 0.1f : 0.2f;
+}
+float Massmore_SHT4x::getHumidityAccuracy() const {
+  return (_variant == Variant::SHT45) ? 1.0f : 1.8f;
 }
 
-float MassmoreSHT4x::saturationVaporPressure(float temperature) {
-  /* สูตร Magnus: 6.112 * exp(a*T/(b+T)) หน่วย hPa */
-  return 6.112f * expf((MASSMORE_SHT4X_MAGNUS_A * temperature) /
-                       (MASSMORE_SHT4X_MAGNUS_B + temperature));
+uint8_t Massmore_SHT4x::getAddress() const { return _address; }
+
+/* ========================================================================= */
+/* Conversion & derived values                                               */
+/* ========================================================================= */
+
+uint8_t Massmore_SHT4x::precisionCommand(Precision precision) {
+  switch (precision) {
+  case Precision::LOW_RES:
+    return CMD_MEAS_LOW;
+  case Precision::MEDIUM_RES:
+    return CMD_MEAS_MED;
+  default:
+    return CMD_MEAS_HIGH;
+  }
 }
 
-float MassmoreSHT4x::dewPoint(float temperature, float humidity) {
-  if (isnan(temperature) || isnan(humidity) || humidity <= 0.0f) {
+uint8_t Massmore_SHT4x::precisionDurationMs(Precision precision) {
+  switch (precision) {
+  case Precision::LOW_RES:
+    return MEAS_LOW_MS;
+  case Precision::MEDIUM_RES:
+    return MEAS_MED_MS;
+  default:
+    return MEAS_HIGH_MS;
+  }
+}
+
+/* datasheet §4.6: T = -45 + 175 · S_T / (2^16 - 1) */
+float Massmore_SHT4x::rawToCelsius(uint16_t raw) {
+  return -45.0f + 175.0f * ((float)raw / 65535.0f);
+}
+
+/* datasheet §4.6: RH = -6 + 125 · S_RH / (2^16 - 1) */
+float Massmore_SHT4x::rawToHumidity(uint16_t raw) {
+  return -6.0f + 125.0f * ((float)raw / 65535.0f);
+}
+
+/* datasheet §4.4 "Checksum Calculation": poly 0x31, init 0xFF, CRC(0xBEEF)=0x92 */
+uint8_t Massmore_SHT4x::crc8(const uint8_t *data, uint8_t length) {
+  uint8_t crc = CRC8_INIT;
+  for (uint8_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ CRC8_POLY) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+float Massmore_SHT4x::dewPoint(float temperatureC, float humidityPercent) {
+  if (isnan(temperatureC) || isnan(humidityPercent) || humidityPercent <= 0.0f) {
     return NAN;
   }
-  float gamma = (MASSMORE_SHT4X_MAGNUS_A * temperature) /
-                    (MASSMORE_SHT4X_MAGNUS_B + temperature) +
-                logf(humidity / 100.0f);
+  float gamma = (MASSMORE_SHT4X_MAGNUS_A * temperatureC) /
+                    (MASSMORE_SHT4X_MAGNUS_B + temperatureC) +
+                logf(humidityPercent / 100.0f);
   return (MASSMORE_SHT4X_MAGNUS_B * gamma) / (MASSMORE_SHT4X_MAGNUS_A - gamma);
 }
 
-float MassmoreSHT4x::absoluteHumidity(float temperature, float humidity) {
-  if (isnan(temperature) || isnan(humidity)) {
+float Massmore_SHT4x::absoluteHumidity(float temperatureC, float humidityPercent) {
+  if (isnan(temperatureC) || isnan(humidityPercent)) {
     return NAN;
   }
-  /* g/m^3 = 216.7 * (RH/100 * es(T)) / (273.15 + T) */
-  float es = saturationVaporPressure(temperature);
-  return 216.7f * ((humidity / 100.0f) * es) / (273.15f + temperature);
+  float es = 6.112f * expf((MASSMORE_SHT4X_MAGNUS_A * temperatureC) /
+                           (MASSMORE_SHT4X_MAGNUS_B + temperatureC));
+  return 216.7f * ((humidityPercent / 100.0f) * es) / (273.15f + temperatureC);
 }
 
-float MassmoreSHT4x::heatIndex(float temperature, float humidity) {
-  if (isnan(temperature) || isnan(humidity)) {
+float Massmore_SHT4x::heatIndex(float temperatureC, float humidityPercent) {
+  if (isnan(temperatureC) || isnan(humidityPercent)) {
     return NAN;
   }
-  /* สูตร Rothfusz ของ NOAA ทำงานในหน่วยฟาเรนไฮต์ */
-  float tF = celsiusToFahrenheit(temperature);
-  float rh = humidity;
-
+  float tF = temperatureC * 9.0f / 5.0f + 32.0f;
+  float rh = humidityPercent;
   float hi = 0.5f * (tF + 61.0f + ((tF - 68.0f) * 1.2f) + (rh * 0.094f));
   if (((hi + tF) / 2.0f) >= 80.0f) {
-    hi = -42.379f + 2.04901523f * tF + 10.14333127f * rh -
-         0.22475541f * tF * rh - 0.00683783f * tF * tF -
-         0.05481717f * rh * rh + 0.00122874f * tF * tF * rh +
-         0.00085282f * tF * rh * rh - 0.00000199f * tF * tF * rh * rh;
+    hi = -42.379f + 2.04901523f * tF + 10.14333127f * rh - 0.22475541f * tF * rh -
+         0.00683783f * tF * tF - 0.05481717f * rh * rh +
+         0.00122874f * tF * tF * rh + 0.00085282f * tF * rh * rh -
+         0.00000199f * tF * tF * rh * rh;
     if (rh < 13.0f && tF >= 80.0f && tF <= 112.0f) {
       hi -= ((13.0f - rh) / 4.0f) * sqrtf((17.0f - fabsf(tF - 95.0f)) / 17.0f);
     } else if (rh > 85.0f && tF >= 80.0f && tF <= 87.0f) {
       hi += ((rh - 85.0f) / 10.0f) * ((87.0f - tF) / 5.0f);
     }
   }
-  return fahrenheitToCelsius(hi);
+  return (hi - 32.0f) * 5.0f / 9.0f;
 }
 
 /* ========================================================================= */
-/* ข้อผิดพลาดและข้อมูลทั่วไป                                                   */
+/* Error reporting / misc                                                    */
 /* ========================================================================= */
 
-bool MassmoreSHT4x::setError(massmore_sht4x_error_t error) {
-  _error = error;
-  return false;
-}
+Massmore_SHT4x::ErrorCode Massmore_SHT4x::lastError() const { return _error; }
 
-void MassmoreSHT4x::clearError() { _error = MASSMORE_SHT4X_OK; }
+const char *Massmore_SHT4x::lastErrorString() const { return errorToString(_error); }
 
-massmore_sht4x_error_t MassmoreSHT4x::lastError() const { return _error; }
-
-const char *MassmoreSHT4x::lastErrorString() const { return errorToString(_error); }
-
-const char *MassmoreSHT4x::errorToString(massmore_sht4x_error_t error) {
+const char *Massmore_SHT4x::errorToString(ErrorCode error) {
   switch (error) {
-  case MASSMORE_SHT4X_OK:
-    return "ปกติ";
-  case MASSMORE_SHT4X_ERR_NOT_BEGUN:
-    return "ยังไม่ได้เรียก begin()";
-  case MASSMORE_SHT4X_ERR_NO_DEVICE:
-    return "ไม่พบอุปกรณ์บนบัส I2C";
-  case MASSMORE_SHT4X_ERR_I2C_WRITE:
-    return "เขียนลงบัส I2C ไม่สำเร็จ";
-  case MASSMORE_SHT4X_ERR_I2C_READ:
-    return "อ่านจากบัส I2C ได้ไม่ครบ";
-  case MASSMORE_SHT4X_ERR_CRC:
-    return "checksum ของข้อมูลไม่ตรง";
-  case MASSMORE_SHT4X_ERR_TIMEOUT:
-    return "รอข้อมูลเกินเวลาที่กำหนด";
-  case MASSMORE_SHT4X_ERR_NOT_READY:
-    return "ยังวัดไม่เสร็จ";
-  case MASSMORE_SHT4X_ERR_WRONG_MODE:
-    return "เรียกใช้ผิดจังหวะ";
-  case MASSMORE_SHT4X_ERR_BAD_ARG:
-    return "พารามิเตอร์ไม่ถูกต้อง";
-  case MASSMORE_SHT4X_ERR_OUT_OF_RANGE:
-    return "ค่าที่ได้อยู่นอกช่วงที่คาดไว้";
-  case MASSMORE_SHT4X_ERR_HEATER_DUTY:
-    return "ใช้ฮีตเตอร์ถี่เกินที่ datasheet อนุญาต";
+  case ErrorCode::OK:
+    return "OK";
+  case ErrorCode::NOT_BEGUN:
+    return "NOT_BEGUN";
+  case ErrorCode::NOT_FOUND:
+    return "NOT_FOUND";
+  case ErrorCode::WRONG_ID:
+    return "WRONG_ID";
+  case ErrorCode::TIMEOUT:
+    return "TIMEOUT";
+  case ErrorCode::CRC_FAIL:
+    return "CRC_FAIL";
+  case ErrorCode::BUS_ERROR:
+    return "BUS_ERROR";
+  case ErrorCode::NOT_READY:
+    return "NOT_READY";
+  case ErrorCode::BUSY:
+    return "BUSY";
+  case ErrorCode::BAD_ARG:
+    return "BAD_ARG";
+  case ErrorCode::HEATER_DUTY:
+    return "HEATER_DUTY";
   default:
-    return "ข้อผิดพลาดที่ไม่รู้จัก";
+    return "UNKNOWN";
   }
 }
 
-uint8_t MassmoreSHT4x::getAddress() const { return _address; }
-
-const char *MassmoreSHT4x::getLibraryVersion() { return MASSMORE_SHT4X_VERSION_STRING; }
-
-uint8_t MassmoreSHT4x::scan(TwoWire *wire, uint8_t *found) {
-  if (wire == nullptr || found == nullptr) {
+uint8_t Massmore_SHT4x::scan(TwoWire &wirePort, uint8_t *found) {
+  if (found == nullptr) {
     return 0;
   }
+  const uint8_t candidates[3] = {I2C_ADDR_A, I2C_ADDR_B, I2C_ADDR_C};
   uint8_t count = 0;
-  const uint8_t candidates[3] = {MASSMORE_SHT4X_I2C_ADDR_A, MASSMORE_SHT4X_I2C_ADDR_B,
-                                 MASSMORE_SHT4X_I2C_ADDR_C};
   for (uint8_t i = 0; i < 3; i++) {
-    wire->beginTransmission(candidates[i]);
-    if (wire->endTransmission() == 0) {
+    wirePort.beginTransmission(candidates[i]);
+    if (wirePort.endTransmission() == 0) {
       found[count++] = candidates[i];
     }
   }
   return count;
 }
+
+const char *Massmore_SHT4x::version() { return MASSMORE_SHT4X_VERSION; }
